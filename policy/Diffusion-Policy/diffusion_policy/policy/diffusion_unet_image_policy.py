@@ -247,6 +247,8 @@ class DiffusionUnetImagePolicy(BaseImagePolicy):
 
         # generate impainting mask
         condition_mask_long = self.mask_generator(trajectory_long.shape)
+        condition_mask_mid = self.mask_generator(trajectory_mid.shape)
+        condition_mask_short = self.mask_generator(trajectory_short.shape)
 
         # Sample noise_long that we'll add to the images
         ################################################
@@ -319,10 +321,7 @@ class DiffusionUnetImagePolicy(BaseImagePolicy):
         else:
             raise ValueError(f"Unsupported prediction type {pred_type}")
 
-
-
         ################################################
-
         loss_long = F.mse_loss(pred_long, target_long, reduction='none')
         loss_long = loss_long * loss_mask_long.type(loss_long.dtype)
         loss_long = reduce(loss_long, 'b ... -> b (...)', 'mean')
@@ -338,7 +337,7 @@ class DiffusionUnetImagePolicy(BaseImagePolicy):
         loss_short = reduce(loss_short, 'b ... -> b (...)', 'mean')
         loss_short = loss_short.mean()
 
-
+        ## 这个比例还可以调，目前这种分配是希望模型多学习长远的规划
         loss = (loss_long * 1.25 + loss_mid * 1 + loss_short * 0.75) / 3
         ################################################
 
