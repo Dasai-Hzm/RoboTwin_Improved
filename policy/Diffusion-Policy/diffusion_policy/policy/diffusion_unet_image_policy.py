@@ -11,6 +11,7 @@ from diffusion_policy.model.diffusion.conditional_unet1d import ConditionalUnet1
 from diffusion_policy.model.diffusion.mask_generator import LowdimMaskGenerator
 from diffusion_policy.model.vision.multi_image_obs_encoder import MultiImageObsEncoder
 from diffusion_policy.common.pytorch_util import dict_apply
+from diffusion_policy.model.bezier_curve.data_fit_bezier_curve import BezerFitter
 
 class DiffusionUnetImagePolicy(BaseImagePolicy):
     def __init__(self, 
@@ -77,11 +78,18 @@ class DiffusionUnetImagePolicy(BaseImagePolicy):
 
         if num_inference_steps is None:
             num_inference_steps = noise_scheduler.config.num_train_timesteps
+
+        ###################################################################################
+        ## 贝塞尔控制点拟合器
         self.num_inference_steps = num_inference_steps
+        self.data_fitter_long = BezerFitter(input_dim=14, num_control_points=5, horizon_length=64)
+        self.data_fitter_mid = BezerFitter(input_dim=14, num_control_points=5, horizon_length=32)
+        self.data_fitter_short = BezerFitter(input_dim=14, num_control_points=5, horizon_length=16)
+        ###################################################################################
     
     # ========= inference  ============
     def conditional_sample(self, 
-            condition_data, condition_mask,
+            condition_data, condition_mask_long,
             local_cond=None, global_cond=None,
             generator=None,
             # keyword arguments to scheduler.step
@@ -101,7 +109,7 @@ class DiffusionUnetImagePolicy(BaseImagePolicy):
 
         for t in scheduler.timesteps:
             # 1. apply conditioning
-            trajectory[condition_mask] = condition_data[condition_mask]
+            trajectory[condition_mask_long] = condition_data[condition_mask_long]
 
             # 2. predict model output
             model_output = model(trajectory, t, 
@@ -115,7 +123,7 @@ class DiffusionUnetImagePolicy(BaseImagePolicy):
                 ).prev_sample
         
         # finally make sure conditioning is enforced
-        trajectory[condition_mask] = condition_data[condition_mask]        
+        trajectory[condition_mask_long] = condition_data[condition_mask_long]        
 
         return trajectory
 
@@ -130,10 +138,10 @@ class DiffusionUnetImagePolicy(BaseImagePolicy):
         nobs = self.normalizer.normalize(obs_dict)
         value = next(iter(nobs.values()))
         B, To = value.shape[:2]
-        T = self.horizon
-        Da = self.action_dim
-        Do = self.obs_feature_dim
-        To = self.n_obs_steps
+        T = self.horizon  
+        Da = self.action_dim  ## 动作维度
+        Do = self.obs_feature_dim  ## 观察特征维度
+        To = self.n_obs_steps  ## 观察步数
 
         # build input
         device = self.device
@@ -197,11 +205,30 @@ class DiffusionUnetImagePolicy(BaseImagePolicy):
         batch_size = nactions.shape[0]
         horizon = nactions.shape[1]
 
+        ################################################
+        ## 生成三个层级控制点的 ground truth 
+        gt_control_pts_long = data_fitter_long.fit(nactions)
+        gt_control_pts_mid = data_fitter_mid.fit(nactions[:, :nactions.shape[1]//2])
+        gt_control_pts_short = data_fitter_short.fit(nactions[:, :nactions.shape[1]//4])
+        ################################################
+
         # handle different ways of passing observation
         local_cond = None
         global_cond = None
-        trajectory = nactions
-        cond_data = trajectory
+
+        ################################################
+        trajectory_long = gt_control_pts_long  ## 把轨迹改成 gt_control_pts_long ，就是拟合的控制点
+        trajectory_mid = gt_control_pts_mid  ## 把轨迹改成 gt_control_pts_mid ，就是拟合的控制点
+        trajectory_short = gt_control_pts_short  ## 把轨迹改成 gt_control_pts_long ，就是拟合的控制点
+        ################################################
+
+
+        cond_data_long = trajectory_long  
+        cond_data_mid = trajectory_mid
+        cond_data_short = trajectory_short  
+
+        ## 由于默认配置是 obs_as_global_cond == true，所以另外一种情况先不考虑
+        ## 下面是 obs 编码，与我们的改进无关，所以先不改
         if self.obs_as_global_cond:
             # reshape B, T, ... to B*T
             this_nobs = dict_apply(nobs, 
@@ -216,44 +243,103 @@ class DiffusionUnetImagePolicy(BaseImagePolicy):
             # reshape back to B, T, Do
             nobs_features = nobs_features.reshape(batch_size, horizon, -1)
             cond_data = torch.cat([nactions, nobs_features], dim=-1)
-            trajectory = cond_data.detach()
+            trajectory_long = cond_data.detach()
 
         # generate impainting mask
-        condition_mask = self.mask_generator(trajectory.shape)
+        condition_mask_long = self.mask_generator(trajectory_long.shape)
 
-        # Sample noise that we'll add to the images
-        noise = torch.randn(trajectory.shape, device=trajectory.device)
-        bsz = trajectory.shape[0]
+        # Sample noise_long that we'll add to the images
+        ################################################
+        # 生成三个层级的噪声
+        noise_long = torch.randn(trajectory_long.shape, device=trajectory_long.device)
+        noise_mid = torch.randn(trajectory_mid.shape, device=trajectory_mid.device)
+        noise_short = torch.randn(trajectory_short.shape, device=trajectory_short.device)
+
+        bsz_long = trajectory_long.shape[0]
+        bsz_mid = trajectory_mid.shape[0]
+        bsz_short = trajectory_short.shape[0]
+
         # Sample a random timestep for each image
-        timesteps = torch.randint(
+        timesteps_long = torch.randint(
             0, self.noise_scheduler.config.num_train_timesteps, 
-            (bsz,), device=trajectory.device
+            (bsz_long,), device=trajectory_long.device
         ).long()
-        # Add noise to the clean images according to the noise magnitude at each timestep
-        # (this is the forward diffusion process)
-        noisy_trajectory = self.noise_scheduler.add_noise(
-            trajectory, noise, timesteps)
         
+        timesteps_mid = torch.randint(
+            0, self.noise_scheduler.config.num_train_timesteps, 
+            (bsz_mid,), device=trajectory_long.device
+        ).long()
+        
+        timesteps_short = torch.randint(
+            0, self.noise_scheduler.config.num_train_timesteps, 
+            (bsz_short,), device=trajectory_long.device
+        ).long()
+
+        # Add noise_long to the clean images according to the noise_long magnitude at each timestep
+        # (this is the forward diffusion process)
+        noisy_trajectory_long = self.noise_scheduler.add_noise(
+            trajectory_long, noise_long, timesteps_long)
+        
+        noisy_trajectory_mid = self.noise_scheduler.add_noise(
+            trajectory_mid, noise_mid, timesteps_mid)
+
+        noisy_trajectory_short = self.noise_scheduler.add_noise(
+            trajectory_short, noise_short, timesteps_short)
+        ################################################
+
         # compute loss mask
-        loss_mask = ~condition_mask
+        loss_mask_long = ~condition_mask_long
+        loss_mask_mid = ~condition_mask_mid
+        loss_mask_short = ~condition_mask_short
 
         # apply conditioning
-        noisy_trajectory[condition_mask] = cond_data[condition_mask]
+        noisy_trajectory_long[condition_mask_long] = cond_data_long[condition_mask_long]
+        noisy_trajectory_mid[condition_mask_mid] = cond_data_mid[condition_mask_mid]
+        noisy_trajectory_short[condition_mask_short] = cond_data_short[condition_mask_short]
+
+
+        # Predict the noise_long residual  去噪过程
+        ## 设法让去噪过程返回一个元组，model 还要修改
+        pred_long, pred_mid, pred_short = self.model(noisy_trajectory_long, timesteps_long, 
+            noisy_trajectory_mid, timesteps_mid, noisy_trajectory_short, timesteps_short,
+            local_cond=local_cond, global_cond=global_cond)  
+            
         
-        # Predict the noise residual
-        pred = self.model(noisy_trajectory, timesteps, 
-            local_cond=local_cond, global_cond=global_cond)
 
         pred_type = self.noise_scheduler.config.prediction_type 
         if pred_type == 'epsilon':
-            target = noise
+            target_long = noise_long
+            target_mid = noise_mid
+            target_short = noise_short
+            
         elif pred_type == 'sample':
-            target = trajectory
+            target_long = trajectory_long
+            target_mid = trajectory_mid
+            target_short = trajectory_short
         else:
             raise ValueError(f"Unsupported prediction type {pred_type}")
 
-        loss = F.mse_loss(pred, target, reduction='none')
-        loss = loss * loss_mask.type(loss.dtype)
-        loss = reduce(loss, 'b ... -> b (...)', 'mean')
-        loss = loss.mean()
+
+
+        ################################################
+
+        loss_long = F.mse_loss(pred_long, target_long, reduction='none')
+        loss_long = loss_long * loss_mask_long.type(loss_long.dtype)
+        loss_long = reduce(loss_long, 'b ... -> b (...)', 'mean')
+        loss_long = loss_long.mean()
+
+        loss_mid = F.mse_loss(pred_mid, target_mid, reduction='none')
+        loss_mid = loss_mid * loss_mask_mid.type(loss_mid.dtype)
+        loss_mid = reduce(loss_mid, 'b ... -> b (...)', 'mean')
+        loss_mid = loss_mid.mean()
+
+        loss_short = F.mse_loss(pred_short, target_short, reduction='none')
+        loss_short = loss_short * loss_mask_short.type(loss_short.dtype)
+        loss_short = reduce(loss_short, 'b ... -> b (...)', 'mean')
+        loss_short = loss_short.mean()
+
+
+        loss = (loss_long * 1.25 + loss_mid * 1 + loss_short * 0.75) / 3
+        ################################################
+
         return loss

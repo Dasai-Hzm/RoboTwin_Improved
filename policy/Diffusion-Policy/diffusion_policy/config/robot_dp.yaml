@@ -1,6 +1,6 @@
 defaults:
   - _self_
-  - task: default_task
+  - task: default_task  ## 加载另一个配置， $表示取用另一个配置中的信息
 
 name: robot_${task.name}
 _target_: diffusion_policy.workspace.robotworkspace.RobotWorkspace
@@ -9,9 +9,9 @@ task_name: ${task.name}
 shape_meta: ${task.shape_meta}
 exp_name: "default"
 
-horizon: 8
-n_obs_steps: 3
-n_action_steps: 8
+horizon: 64  ## 预测的步数，尝试把这里改大一些，改成64
+n_obs_steps: 4 ## 观测的步数，这里略微调大，原来3
+n_action_steps: 8  ## 实际执行的步数
 n_latency_steps: 0
 dataset_obs_steps: ${n_obs_steps}
 past_action_visible: False

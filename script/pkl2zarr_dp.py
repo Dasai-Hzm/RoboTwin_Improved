@@ -21,11 +21,11 @@ def main():
     task_name = args.task_name
     num = args.expert_data_num
     head_camera_type = args.head_camera_type
-    load_dir = f'data/{task_name}_{head_camera_type}_pkl'
+    load_dir = f'/DATA/disk0/data_robotwin_new/{task_name}_{head_camera_type}_pkl'  ## 试图修改这里 
     
     total_count = 0
 
-    save_dir = f'./policy/Diffusion-Policy/data/{task_name}_{head_camera_type}_{num}.zarr'
+    save_dir = f'/DATA/disk0/data_robotwin_new/processed_data/{task_name}_{head_camera_type}_{num}.zarr'  ## 试图修改这里 
 
     if os.path.exists(save_dir):
         shutil.rmtree(save_dir)
