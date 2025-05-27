@@ -3,7 +3,7 @@ render_freq: 0
 eval_video_log: false
 use_seed: false
 collect_data: true
-save_path: /DATA/disk0/data_robotwin_new  ## 试图修改这里，成功了
+save_path: /DATA/disk0/data_robotwin_new  ## 试图修改这里，把保存路径改了
 dual_arm: true
 st_episode: 0
 head_camera_type: D435

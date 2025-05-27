@@ -292,11 +292,14 @@ class DiffusionUnetImagePolicy(BaseImagePolicy):
         start = To - 1
         end = start + self.n_action_steps
         action = action_pred[:,start:end, :]
-        
+        # 预测了 12 步，实际执行了 8 步
+
+
         result = {
             'action': action,
             'action_pred': action_pred
         }
+
         return result
 
     # ========= training  ============
@@ -315,7 +318,6 @@ class DiffusionUnetImagePolicy(BaseImagePolicy):
         ## 生成三个层级控制点的 ground truth 
         nactions = nactions.transpose(1, 2) # (batch_size, act_dim, horizon)
         # (batch_size, act_dim, horizon) -> (batch_size, act_dim, num_ctrl_pts)
-        # 这个拟合的代码还得修改 维数不对
         gt_control_pts_long = data_fitter_long.fit(nactions)
         gt_control_pts_mid = data_fitter_mid.fit(nactions[:, :, :nactions.shape[1]//2])
         gt_control_pts_short = data_fitter_short.fit(nactions[:, :, :nactions.shape[1]//4])
