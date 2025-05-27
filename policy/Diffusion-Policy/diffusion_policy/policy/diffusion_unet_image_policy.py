@@ -319,9 +319,9 @@ class DiffusionUnetImagePolicy(BaseImagePolicy):
         ## 生成三个层级控制点的 ground truth 
         nactions = nactions.transpose(1, 2) # (batch_size, act_dim, horizon)
         # (batch_size, act_dim, horizon) -> (batch_size, act_dim, num_ctrl_pts)
-        gt_control_pts_long = data_fitter_long.fit(nactions)
-        gt_control_pts_mid = data_fitter_mid.fit(nactions[:, :, :nactions.shape[1]//2])
-        gt_control_pts_short = data_fitter_short.fit(nactions[:, :, :nactions.shape[1]//4])
+        gt_control_pts_long = self.data_fitter_long.fit(nactions)
+        gt_control_pts_mid = self.data_fitter_mid.fit(nactions[:, :, :nactions.shape[1]//2])
+        gt_control_pts_short = self.data_fitter_short.fit(nactions[:, :, :nactions.shape[1]//4])
         ################################################
 
         # handle different ways of passing observation
