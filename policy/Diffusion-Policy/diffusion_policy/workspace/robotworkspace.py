@@ -17,6 +17,7 @@ import copy
 import random
 import tqdm
 import numpy as np
+import wandb # 记得导入 wandb 包！
 from diffusion_policy.workspace.base_workspace import BaseWorkspace
 from diffusion_policy.policy.diffusion_unet_image_policy import DiffusionUnetImagePolicy
 from diffusion_policy.dataset.base_dataset import BaseImageDataset
@@ -111,16 +112,17 @@ class RobotWorkspace(BaseWorkspace):
         env_runner = None
 
         # configure logging
-        # wandb_run = wandb.init(
-        #     dir=str(self.output_dir),
-        #     config=OmegaConf.to_container(cfg, resolve=True),
-        #     **cfg.logging
-        # )
-        # wandb.config.update(
-        #     {
-        #         "output_dir": self.output_dir,
-        #     }
-        # )
+        # 把这些注释都取消了
+        wandb_run = wandb.init(
+            dir=str(self.output_dir),
+            config=OmegaConf.to_container(cfg, resolve=True),
+            **cfg.logging
+        )
+        wandb.config.update(
+            {
+                "output_dir": self.output_dir,
+            }
+        )
 
         # configure checkpoint
         topk_manager = TopKCheckpointManager(

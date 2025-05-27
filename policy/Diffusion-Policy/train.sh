@@ -29,11 +29,11 @@ else
     echo -e "\033[33mTrain mode\033[0m"
 fi
 
-if [ ! -d "./data/${task_name}_${head_camera_type}_${expert_data_num}.zarr" ]; then
+if [ ! -d "/DATA/disk0/data_robotwin_new/processed_data/${task_name}_${head_camera_type}_${expert_data_num}.zarr" ]; then  # 试图修改这里
     echo "zarr does not exist, run pkl2zarr_dp.py"
     cd ../..
     expert_data_num_minus_one=$((expert_data_num - 1))
-    if [ ! -d "./data/${task_name}_${head_camera_type}_pkl/episode${expert_data_num_minus_one}" ]; then
+    if [ ! -d "/DATA/disk0/data_robotwin_new/${task_name}_${head_camera_type}_pkl/episode${expert_data_num_minus_one}" ]; then  # 试图修改这里
         echo "error: expert data does not exist"
         exit 1
     else
@@ -45,9 +45,10 @@ fi
 export HYDRA_FULL_ERROR=1 
 export CUDA_VISIBLE_DEVICES=${gpu_id}
 
+# zarr_path 也做了修改
 python train.py --config-name=${config_name}.yaml \
                             task.name=${task_name} \
-                            task.dataset.zarr_path="data/${task_name}_${head_camera_type}_${expert_data_num}.zarr" \
+                            task.dataset.zarr_path="/DATA/disk0/data_robotwin_new/processed_data/${task_name}_${head_camera_type}_${expert_data_num}.zarr" \
                             training.debug=$DEBUG \
                             training.seed=${seed} \
                             training.device="cuda:0" \
