@@ -356,7 +356,7 @@ class DiffusionUnetImagePolicy(BaseImagePolicy):
             cond_data = torch.cat([nactions, nobs_features], dim=-1)
             trajectory_long = cond_data.detach()
 
-        # generate impainting mask
+        # generate impainting mask  # 这里面临这维度顺序引发的问题，需要整体调整
         condition_mask_long = self.mask_generator(trajectory_long.shape)
         condition_mask_mid = self.mask_generator(trajectory_mid.shape)
         condition_mask_short = self.mask_generator(trajectory_short.shape)
