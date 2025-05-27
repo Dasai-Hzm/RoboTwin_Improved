@@ -69,7 +69,7 @@ class BezierFitter:
             batch_size = input_points.shape[0]
             if input_points.shape[1:] != (self.input_dim, self.horizon_length):
                 raise ValueError(
-                    f"批量输入数据形状应为(batch_size, {self.input_dim}, {self.horizon_length}), "
+                    f"批量输入数据形状应为({batch_size}, {self.input_dim}, {self.horizon_length}), "
                     f"实际收到 {input_points.shape}"
                 )
             
