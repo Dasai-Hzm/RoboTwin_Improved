@@ -84,6 +84,9 @@ class BezierFitter:
             raise ValueError("输入数据必须是2维或3维数组")
 
     def _fit_single(self, input_points):
+        input_points = input_points.cpu().numpy() 
+        # 好像是因为 Numpy 不能直接操作 GPU 所以先转到 CPU 上处理
+
         """拟合单个样本"""
         # 生成参数空间
         t_space = np.linspace(0, 1, self.horizon_length)
