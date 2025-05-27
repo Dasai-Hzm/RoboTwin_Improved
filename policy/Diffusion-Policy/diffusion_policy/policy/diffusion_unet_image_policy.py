@@ -72,6 +72,9 @@ class DiffusionUnetImagePolicy(BaseImagePolicy):
         self.model_mid = model
         self.model_short = model
 
+        self.proj_up = nn.Linear(act_dim * num_ctrl_pts, self.transformer_emb_size)
+        self.proj_back = nn.Linear(self.transformer_emb_size, act_dim * num_ctrl_pts)
+
         self.noise_scheduler = noise_scheduler
         self.mask_generator = LowdimMaskGenerator(
             action_dim=action_dim,
@@ -103,10 +106,11 @@ class DiffusionUnetImagePolicy(BaseImagePolicy):
         self.transformer_emb_size = transformer_emb_size
         self.cls_tokens = nn.Parameter(torch.zeros(3, 1, self.transformer_emb_size))  # (3, 1, hidden_size)
         nn.init.trunc_normal_(self.cls_tokens, std=0.02)  # 初始化一下
+        self.cls_tokens_expand = self.cls_tokens.expand(-1, batch_size, -1).transpose(0, 1)
     
     # ========= inference  ============
     def conditional_sample(self, 
-            condition_data, condition_mask_long,
+            condition_data, condition_mask,
             local_cond=None, global_cond=None,
             generator=None,
             # keyword arguments to scheduler.step
@@ -119,10 +123,30 @@ class DiffusionUnetImagePolicy(BaseImagePolicy):
 
         scheduler = self.noise_scheduler
 
-        trajectory = torch.randn(
-            size=condition_data.shape, 
-            dtype=condition_data.dtype,
-            device=condition_data.device,
+        condition_data_long = condition_data[:, self.num_ctrl_pts:, :]
+        condition_data_mid = condition_data[:, self.num_ctrl_pts:self.num_ctrl_pts*2, :]
+        condition_data_short = condition_data[:, :self.num_ctrl_pts, :]
+
+        condition_mask_long = condition_mask[:, self.num_ctrl_pts:, :]
+        condition_mask_mid = condition_mask[:, self.num_ctrl_pts:self.num_ctrl_pts*2, :]
+        condition_mask_short = condition_mask[:, :self.num_ctrl_pts, :]
+
+        trajectory_long = torch.randn(
+            size=condition_data_long.shape, 
+            dtype=condition_data_long.dtype,
+            device=condition_data_long.device,
+            generator=generator)
+
+        trajectory_mid = torch.randn(
+            size=condition_data_mid.shape, 
+            dtype=condition_data_mid.dtype,
+            device=condition_data_mid.device,
+            generator=generator)
+
+        trajectory_short = torch.randn(
+            size=condition_data_short.shape, 
+            dtype=condition_data_short.dtype,
+            device=condition_data_short.device,
             generator=generator)
     
         # set step values
@@ -130,21 +154,70 @@ class DiffusionUnetImagePolicy(BaseImagePolicy):
 
         for t in scheduler.timesteps:
             # 1. apply conditioning
-            trajectory[condition_mask_long] = condition_data[condition_mask_long]
+            trajectory_long[condition_mask_long] = condition_data_long[condition_mask_long]
+            trajectory_mid[condition_mask_mid] = condition_data_mid[condition_mask_mid]
+            trajectory_short[condition_mask_short] = condition_data_short[condition_mask_short]
 
             # 2. predict model output
-            model_output_long = model_long(trajectory, t, 
+            pre_model_output_long = model_long(trajectory_long, t, 
+                local_cond=local_cond, global_cond=global_cond)
+                        
+            pre_model_output_mid = model_long(trajectory_mid, t, 
                 local_cond=local_cond, global_cond=global_cond)
 
+            pre_model_output_short = model_long(trajectory_short, t, 
+                local_cond=local_cond, global_cond=global_cond)
+
+            batch_size, _, act_dim = pre_model_output_long.shape
+
+            token_long = pre_model_output_long.reshape(batch_size, -1)
+            token_mid = pre_model_output_mid.reshape(batch_size, -1)
+            token_short = pre_model_output_short.reshape(batch_size, -1)
+
+            token_long  = self.proj_up(token_long)   # (batch_size, hidden_size)    
+            token_mid   = self.proj_up(token_mid)
+            token_short = self.proj_up(token_short)
+
+            tokens = torch.stack([token_long, token_mid, token_short], dim=1)  # (batch_size, 3, hidden_size)
+
+            inputs = torch.cat([self.cls_tokens_expand, tokens], dim=1)                    # (batch_size, 6, hidden_size)
+
+            output = self.cross_attention(inputs_embeds=inputs)
+
+            cls_outputs = output.last_hidden_state[:, :3, :]  # (batch_size, 3, hidden_size)
+
+            final_pred = self.proj_back(cls_outputs)   # (batch_size, 3, act_dim * num_ctrl_pts)
+            final_pred = final_pred.reshape(batch_size, 3, num_ctrl_pts, act_dim)
+
+            model_output_long  = final_pred[:, 0, :, :]  # (batch_size, num_ctrl_pts, act_dim)
+            model_output_mid   = final_pred[:, 1, :, :]
+            model_output_short = final_pred[:, 2, :, :]
+
             # 3. compute previous image: x_t -> x_t-1
-            trajectory = scheduler.step(
-                model_output, t, trajectory, 
+            trajectory_long = scheduler.step(
+                model_output_long, t, trajectory_long, 
+                generator=generator,
+                **kwargs
+                ).prev_sample
+
+            trajectory_mid = scheduler.step(
+                model_output_mid, t, trajectory_mid, 
+                generator=generator,
+                **kwargs
+                ).prev_sample
+
+            trajectory_short = scheduler.step(
+                model_output_short, t, trajectory_short, 
                 generator=generator,
                 **kwargs
                 ).prev_sample
         
         # finally make sure conditioning is enforced
-        trajectory[condition_mask_long] = condition_data[condition_mask_long]        
+        trajectory_long[condition_mask_long] = condition_data_long[condition_mask_long] 
+        trajectory_mid[condition_mask_mid] = condition_data_mid[condition_mask_mid] 
+        trajectory_short[condition_mask_short] = condition_data_short[condition_mask_short]
+
+        trajectory = torch.cat([target_long, trajectory_mid, trajectory_short], dim=1)        
 
         return trajectory
 
@@ -209,11 +282,11 @@ class DiffusionUnetImagePolicy(BaseImagePolicy):
         ctrl_pts_pred_long = ctrl_pts_pred[:, self.num_ctrl_pts:, :]
         ctrl_pts_pred_mid = ctrl_pts_pred[:, self.num_ctrl_pts:self.num_ctrl_pts*2, :]
         ctrl_pts_pred_short = ctrl_pts_pred[:, :self.num_ctrl_pts, :]
+        
+        # 执行上采样
+        action_pred = bezier_upsample(ctrl_pts_pred_long, ctrl_pts_pred_mid, ctrl_pts_pred_short, self.horizon)
+        # 形状 (batch_size, horizon / 4 = 16, act_dim)
 
-        action_upsampled = bezier_upsample(ctrl_pts_pred_long, ctrl_pts_pred_mid, ctrl_pts_pred_short, self.horizon)
-        # 形状 (batch_size, horizon / 4 = 8, act_dim)
-
-        ## 这里需要一些上采样代码
 
         # get action
         start = To - 1
@@ -242,6 +315,7 @@ class DiffusionUnetImagePolicy(BaseImagePolicy):
         ## 生成三个层级控制点的 ground truth 
         nactions = nactions.transpose(1, 2) # (batch_size, act_dim, horizon)
         # (batch_size, act_dim, horizon) -> (batch_size, act_dim, num_ctrl_pts)
+        # 这个拟合的代码还得修改 维数不对
         gt_control_pts_long = data_fitter_long.fit(nactions)
         gt_control_pts_mid = data_fitter_mid.fit(nactions[:, :, :nactions.shape[1]//2])
         gt_control_pts_short = data_fitter_short.fit(nactions[:, :, :nactions.shape[1]//4])
@@ -341,20 +415,18 @@ class DiffusionUnetImagePolicy(BaseImagePolicy):
         token_mid   = pre_pred_mid.reshape(batch_size, -1)
         token_short = pre_pred_short.reshape(batch_size, -1)
 
-        proj = nn.Linear(act_dim * num_ctrl_pts, self.transformer_emb_size).to(trajectory_long.device) 
-
-        token_long  = proj(token_long)   # (batch_size, hidden_size)    
-        token_mid   = proj(token_mid)
-        token_short = proj(token_short)
+        token_long  = self.proj_up(token_long)   # (batch_size, hidden_size)    
+        token_mid   = self.proj_up(token_mid)
+        token_short = self.proj_up(token_short)
 
         tokens = torch.stack([token_long, token_mid, token_short], dim=1)  # (batch_size, 3, hidden_size)
-        cls_tokens_expand = self.cls_tokens.expand(-1, batch_size, -1).transpose(0, 1)
-        inputs = torch.cat([cls_tokens_expand, tokens], dim=1)                    # (batch_size, 6, hidden_size)
 
-        output = model(inputs_embeds=inputs)
+        inputs = torch.cat([self.cls_tokens_expand, tokens], dim=1)                    # (batch_size, 6, hidden_size)
+
+        output = self.cross_attention(inputs_embeds=inputs)
         cls_outputs = output.last_hidden_state[:, :3, :]  # (batch_size, 3, hidden_size)
-        proj_back = nn.Linear(self.transformer_emb_size, act_dim * num_ctrl_pts).to(trajectory_long.device)  
-        final_pred = proj_back(cls_outputs)   # (batch_size, 3, act_dim * num_ctrl_pts)
+
+        final_pred = self.proj_back(cls_outputs)   # (batch_size, 3, act_dim * num_ctrl_pts)
         final_pred = final_pred.reshape(batch_size, 3, act_dim, num_ctrl_pts)
 
         pred_long  = final_pred[:, 0, :, :]  # (batch_size, act_dim, num_ctrl_pts)
