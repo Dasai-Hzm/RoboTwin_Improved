@@ -12,7 +12,8 @@ from diffusion_policy.model.diffusion.conditional_unet1d import ConditionalUnet1
 from diffusion_policy.model.diffusion.mask_generator import LowdimMaskGenerator
 from diffusion_policy.model.vision.multi_image_obs_encoder import MultiImageObsEncoder
 from diffusion_policy.common.pytorch_util import dict_apply
-from diffusion_policy.model.bezier_curve.data_fit_bezier_curve import BezerFitter
+from diffusion_policy.model.bezier_curve.data_fit_bezier_curve import BezierFitter
+from diffusion_policy.model.bezier_curve.upsample_bezier_curve import bezier_upsample
 
 class DiffusionUnetImagePolicy(BaseImagePolicy):
     def __init__(self, 
@@ -30,6 +31,7 @@ class DiffusionUnetImagePolicy(BaseImagePolicy):
             n_groups=8,
             cond_predict_scale=True,
             transformer_emb_size=512,
+            num_ctrl_pts=5,
             # parameters passed to step
             **kwargs):
         super().__init__()
@@ -65,7 +67,11 @@ class DiffusionUnetImagePolicy(BaseImagePolicy):
         self.cross_attention = BertModel(config)
 
         self.obs_encoder = obs_encoder
-        self.model = model
+
+        self.model_long = model
+        self.model_mid = model
+        self.model_short = model
+
         self.noise_scheduler = noise_scheduler
         self.mask_generator = LowdimMaskGenerator(
             action_dim=action_dim,
@@ -85,13 +91,13 @@ class DiffusionUnetImagePolicy(BaseImagePolicy):
 
         if num_inference_steps is None:
             num_inference_steps = noise_scheduler.config.num_train_timesteps
-
+        self.num_inference_steps = num_inference_steps
         ###################################################################################
         ## 贝塞尔控制点拟合器
-        self.num_inference_steps = num_inference_steps
-        self.data_fitter_long = BezerFitter(input_dim=14, num_control_points=5, horizon_length=64)
-        self.data_fitter_mid = BezerFitter(input_dim=14, num_control_points=5, horizon_length=32)
-        self.data_fitter_short = BezerFitter(input_dim=14, num_control_points=5, horizon_length=16)
+        self.num_ctrl_pts = num_ctrl_pts
+        self.data_fitter_long = BezierFitter(input_dim=self.action_dim, num_control_points=self.num_ctrl_pts, horizon_length=self.horizion)
+        self.data_fitter_mid = BezierFitter(input_dim=self.action_dim, num_control_points=self.num_ctrl_pts, horizon_length=self.horizon//2)
+        self.data_fitter_short = BezierFitter(input_dim=self.action_dim, num_control_points=self.num_ctrl_pts, horizon_length=self.horizon//4)
         ###################################################################################
 
         self.transformer_emb_size = transformer_emb_size
@@ -106,7 +112,11 @@ class DiffusionUnetImagePolicy(BaseImagePolicy):
             # keyword arguments to scheduler.step
             **kwargs
             ):
-        model = self.model
+        
+        model_long = self.model_long
+        model_mid = self.model_mid
+        model_short = self.model_short
+
         scheduler = self.noise_scheduler
 
         trajectory = torch.randn(
@@ -123,7 +133,7 @@ class DiffusionUnetImagePolicy(BaseImagePolicy):
             trajectory[condition_mask_long] = condition_data[condition_mask_long]
 
             # 2. predict model output
-            model_output = model(trajectory, t, 
+            model_output_long = model_long(trajectory, t, 
                 local_cond=local_cond, global_cond=global_cond)
 
             # 3. compute previous image: x_t -> x_t-1
@@ -168,9 +178,10 @@ class DiffusionUnetImagePolicy(BaseImagePolicy):
             # reshape back to B, Do
             global_cond = nobs_features.reshape(B, -1)
             # empty data for action
-            cond_data = torch.zeros(size=(B, T, Da), device=device, dtype=dtype)
+            cond_data = torch.zeros(size=(B, self.num_ctrl_pts * 3, Da), device=device, dtype=dtype)
             cond_mask = torch.zeros_like(cond_data, dtype=torch.bool)
         else:
+            # 后面这种情况基本不用，所以先不改这里的代码
             # condition through impainting
             this_nobs = dict_apply(nobs, lambda x: x[:,:To,...].reshape(-1,*x.shape[2:]))
             nobs_features = self.obs_encoder(this_nobs)
@@ -190,13 +201,24 @@ class DiffusionUnetImagePolicy(BaseImagePolicy):
             **self.kwargs)
         
         # unnormalize prediction
-        naction_pred = nsample[...,:Da]
-        action_pred = self.normalizer['action'].unnormalize(naction_pred)
+        # 先假定这个 naction_pred 的形状是(B, self.num_ctrl_pts * 3, act_dim)
+
+        naction_pred = nsample[...,:Da] # 最后一维应该是 act_dim
+        ctrl_pts_pred = self.normalizer['action'].unnormalize(naction_pred)
+
+        ctrl_pts_pred_long = ctrl_pts_pred[:, self.num_ctrl_pts:, :]
+        ctrl_pts_pred_mid = ctrl_pts_pred[:, self.num_ctrl_pts:self.num_ctrl_pts*2, :]
+        ctrl_pts_pred_short = ctrl_pts_pred[:, :self.num_ctrl_pts, :]
+
+        action_upsampled = bezier_upsample(ctrl_pts_pred_long, ctrl_pts_pred_mid, ctrl_pts_pred_short, self.horizon)
+        # 形状 (batch_size, horizon / 4 = 8, act_dim)
+
+        ## 这里需要一些上采样代码
 
         # get action
         start = To - 1
         end = start + self.n_action_steps
-        action = action_pred[:,start:end]
+        action = action_pred[:,start:end, :]
         
         result = {
             'action': action,
@@ -218,9 +240,11 @@ class DiffusionUnetImagePolicy(BaseImagePolicy):
 
         ################################################
         ## 生成三个层级控制点的 ground truth 
+        nactions = nactions.transpose(1, 2) # (batch_size, act_dim, horizon)
+        # (batch_size, act_dim, horizon) -> (batch_size, act_dim, num_ctrl_pts)
         gt_control_pts_long = data_fitter_long.fit(nactions)
-        gt_control_pts_mid = data_fitter_mid.fit(nactions[:, :nactions.shape[1]//2])
-        gt_control_pts_short = data_fitter_short.fit(nactions[:, :nactions.shape[1]//4])
+        gt_control_pts_mid = data_fitter_mid.fit(nactions[:, :, :nactions.shape[1]//2])
+        gt_control_pts_short = data_fitter_short.fit(nactions[:, :, :nactions.shape[1]//4])
         ################################################
 
         # handle different ways of passing observation
@@ -302,15 +326,17 @@ class DiffusionUnetImagePolicy(BaseImagePolicy):
 
 
         # Predict the noise_long residual  去噪过程
-        pre_pred_long = self.model(noisy_trajectory_long, timesteps, 
+        pre_pred_long = self.model_long(noisy_trajectory_long, timesteps, 
             local_cond=local_cond, global_cond=global_cond)  
                 
-        pre_pred_mid = self.model(noisy_trajectory_mid, timesteps, 
+        pre_pred_mid = self.model_mid(noisy_trajectory_mid, timesteps, 
             local_cond=local_cond, global_cond=global_cond)  
         
-        pre_pred_short = self.model(noisy_trajectory_short, timesteps, 
+        pre_pred_short = self.model_short(noisy_trajectory_short, timesteps, 
             local_cond=local_cond, global_cond=global_cond)  
         
+        batch_size, act_dim, num_ctrl_pts = pre_pred_long.shape
+
         token_long  = pre_pred_long.reshape(batch_size, -1)  # (batch_size, act_dim * num_ctrl_pts)
         token_mid   = pre_pred_mid.reshape(batch_size, -1)
         token_short = pre_pred_short.reshape(batch_size, -1)

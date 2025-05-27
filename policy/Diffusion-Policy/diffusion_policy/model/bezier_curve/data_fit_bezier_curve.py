@@ -7,12 +7,12 @@ from scipy.optimize import least_squares
 from scipy.special import comb
 
 class BezierFitter:
-    def __init__(self, input_dim=14, num_control_points=4, horizon_length=64):
+    def __init__(self, input_dim=14, num_control_points=5, horizon_length=32):
         """
         贝塞尔曲线拟合器
         :param input_dim: 输入数据维度 (默认14)
-        :param num_control_points: 控制点数量 (至少2个，默认4)
-        :param horizon_length: 输入数据长度 (至少2个点，默认64)
+        :param num_control_points: 控制点数量 (至少2个，默认5)
+        :param horizon_length: 输入数据长度 (至少2个点，默认32)
         """
         # 参数验证
         if num_control_points < 2:

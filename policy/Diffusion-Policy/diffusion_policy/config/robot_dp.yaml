@@ -9,7 +9,7 @@ task_name: ${task.name}
 shape_meta: ${task.shape_meta}
 exp_name: "default"
 
-horizon: 64  ## 预测的步数，尝试把这里改大一些，改成64
+horizon: 32  ## 预测的步数，尝试把这里改大一些，改成32
 n_obs_steps: 4 ## 观测的步数，这里略微调大，原来3
 n_action_steps: 8  ## 实际执行的步数
 n_latency_steps: 0
