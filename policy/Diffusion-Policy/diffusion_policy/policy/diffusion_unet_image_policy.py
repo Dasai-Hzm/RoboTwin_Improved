@@ -71,9 +71,10 @@ class DiffusionUnetImagePolicy(BaseImagePolicy):
         self.model_long = model
         self.model_mid = model
         self.model_short = model
+        self.transformer_emb_size = transformer_emb_size
 
-        self.proj_up = nn.Linear(act_dim * num_ctrl_pts, self.transformer_emb_size)
-        self.proj_back = nn.Linear(self.transformer_emb_size, act_dim * num_ctrl_pts)
+        self.proj_up = nn.Linear(action_dim * num_ctrl_pts, self.transformer_emb_size)
+        self.proj_back = nn.Linear(self.transformer_emb_size, action_dim * num_ctrl_pts)
 
         self.noise_scheduler = noise_scheduler
         self.mask_generator = LowdimMaskGenerator(
@@ -98,7 +99,7 @@ class DiffusionUnetImagePolicy(BaseImagePolicy):
         ###################################################################################
         ## 贝塞尔控制点拟合器
         self.num_ctrl_pts = num_ctrl_pts
-        self.data_fitter_long = BezierFitter(input_dim=self.action_dim, num_control_points=self.num_ctrl_pts, horizon_length=self.horizion)
+        self.data_fitter_long = BezierFitter(input_dim=self.action_dim, num_control_points=self.num_ctrl_pts, horizon_length=self.horizon)
         self.data_fitter_mid = BezierFitter(input_dim=self.action_dim, num_control_points=self.num_ctrl_pts, horizon_length=self.horizon//2)
         self.data_fitter_short = BezierFitter(input_dim=self.action_dim, num_control_points=self.num_ctrl_pts, horizon_length=self.horizon//4)
         ###################################################################################
@@ -106,7 +107,7 @@ class DiffusionUnetImagePolicy(BaseImagePolicy):
         self.transformer_emb_size = transformer_emb_size
         self.cls_tokens = nn.Parameter(torch.zeros(3, 1, self.transformer_emb_size))  # (3, 1, hidden_size)
         nn.init.trunc_normal_(self.cls_tokens, std=0.02)  # 初始化一下
-        self.cls_tokens_expand = self.cls_tokens.expand(-1, batch_size, -1).transpose(0, 1)
+        self.cls_tokens_expand = self.cls_tokens.expand(-1, 128, -1).transpose(0, 1)  # 这里 batch_size 写死了，以后再改
     
     # ========= inference  ============
     def conditional_sample(self, 

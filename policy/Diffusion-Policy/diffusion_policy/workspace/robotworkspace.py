@@ -45,8 +45,11 @@ class RobotWorkspace(BaseWorkspace):
         self.model: DiffusionUnetImagePolicy = hydra.utils.instantiate(cfg.policy)
 
         self.ema_model: DiffusionUnetImagePolicy = None
+        
         if cfg.training.use_ema:
-            self.ema_model = copy.deepcopy(self.model)
+            self.ema_model = hydra.utils.instantiate(cfg.policy)
+            self.ema_model.load_state_dict(self.model.state_dict())
+        # 疑似遇到神秘报错，这里会出现模型不能拷贝的情况（或许和模块有修改有关），因此上两行的内容也做了对应修改
 
         # configure training state
         self.optimizer = hydra.utils.instantiate(
