@@ -314,6 +314,7 @@ class DiffusionUnetImagePolicy(BaseImagePolicy):
         nactions = self.normalizer['action'].normalize(batch['action'])
         batch_size = nactions.shape[0]
         horizon = nactions.shape[1]
+        device = self.device
 
         ################################################
         ## 生成三个层级控制点的 ground truth 
@@ -329,9 +330,10 @@ class DiffusionUnetImagePolicy(BaseImagePolicy):
         global_cond = None
 
         ################################################
-        trajectory_long = gt_control_pts_long  ## 把轨迹改成 gt_control_pts_long ，就是拟合的控制点
-        trajectory_mid = gt_control_pts_mid  ## 把轨迹改成 gt_control_pts_mid ，就是拟合的控制点
-        trajectory_short = gt_control_pts_short  ## 把轨迹改成 gt_control_pts_long ，就是拟合的控制点
+        # 试图交换维度顺序
+        trajectory_long = torch.tensor(gt_control_pts_long, device=device).transpose(1, 2)  ## 把轨迹改成 gt_control_pts_long ，就是拟合的控制点
+        trajectory_mid = torch.tensor(gt_control_pts_mid, device=device).transpose(1, 2)  ## 把轨迹改成 gt_control_pts_mid ，就是拟合的控制点
+        trajectory_short = torch.tensor(gt_control_pts_short, device=device).transpose(1, 2)  ## 把轨迹改成 gt_control_pts_long ，就是拟合的控制点
         ################################################
 
         cond_data_long = trajectory_long  
@@ -412,7 +414,7 @@ class DiffusionUnetImagePolicy(BaseImagePolicy):
         pre_pred_short = self.model_short(noisy_trajectory_short, timesteps, 
             local_cond=local_cond, global_cond=global_cond)  
         
-        batch_size, act_dim, num_ctrl_pts = pre_pred_long.shape
+        batch_size, num_ctrl_pts, act_dim = pre_pred_long.shape  # 这里调整了，以改变维度顺序
 
         token_long  = pre_pred_long.reshape(batch_size, -1)  # (batch_size, act_dim * num_ctrl_pts)
         token_mid   = pre_pred_mid.reshape(batch_size, -1)
@@ -430,7 +432,7 @@ class DiffusionUnetImagePolicy(BaseImagePolicy):
         cls_outputs = output.last_hidden_state[:, :3, :]  # (batch_size, 3, hidden_size)
 
         final_pred = self.proj_back(cls_outputs)   # (batch_size, 3, act_dim * num_ctrl_pts)
-        final_pred = final_pred.reshape(batch_size, 3, act_dim, num_ctrl_pts)
+        final_pred = final_pred.reshape(batch_size, 3, num_ctrl_pts, act_dim)  # 这里调整了，以改变维度顺序
 
         pred_long  = final_pred[:, 0, :, :]  # (batch_size, act_dim, num_ctrl_pts)
         pred_mid   = final_pred[:, 1, :, :]
