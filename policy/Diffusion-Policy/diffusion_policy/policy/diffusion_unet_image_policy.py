@@ -95,29 +95,26 @@ class DiffusionUnetImagePolicy(BaseImagePolicy):
         if num_inference_steps is None:
             num_inference_steps = noise_scheduler.config.num_train_timesteps
         self.num_inference_steps = num_inference_steps
-        ###################################################################################
-        ## 贝塞尔控制点拟合器
+
+        # 贝塞尔控制点拟合器
         self.num_ctrl_pts = num_ctrl_pts
         self.data_fitter_long = BezierFitter(input_dim=self.action_dim, num_control_points=self.num_ctrl_pts, horizon_length=self.horizon)
         self.data_fitter_mid = BezierFitter(input_dim=self.action_dim, num_control_points=self.num_ctrl_pts, horizon_length=self.horizon//2)
         self.data_fitter_short = BezierFitter(input_dim=self.action_dim, num_control_points=self.num_ctrl_pts, horizon_length=self.horizon//4)
-        ###################################################################################
+
 
     
     # ========= inference  ============
     def conditional_sample(self, 
             condition_data, condition_mask,
-            local_cond=None, global_cond=None,
+            local_cond=None, global_cond_long=None,
+            global_cond_mid=None, global_cond_short=None,
             generator=None,
             # keyword arguments to scheduler.step
             **kwargs
             ):
         
-        # 这里还得改，已经没有 model_long 了
-        model_long = self.model_long
-        model_mid = self.model_mid
-        model_short = self.model_short
-
+        model = self.model
         scheduler = self.noise_scheduler
 
         condition_data_long = condition_data[:, self.num_ctrl_pts:, :]
@@ -156,39 +153,8 @@ class DiffusionUnetImagePolicy(BaseImagePolicy):
             trajectory_short[condition_mask_short] = condition_data_short[condition_mask_short]
 
             # 2. predict model output
-            pre_model_output_long = model_long(trajectory_long, t, 
-                local_cond=local_cond, global_cond=global_cond)
-                        
-            pre_model_output_mid = model_long(trajectory_mid, t, 
-                local_cond=local_cond, global_cond=global_cond)
-
-            pre_model_output_short = model_long(trajectory_short, t, 
-                local_cond=local_cond, global_cond=global_cond)
-
-            batch_size, _, act_dim = pre_model_output_long.shape
-
-            token_long = pre_model_output_long.reshape(batch_size, -1)
-            token_mid = pre_model_output_mid.reshape(batch_size, -1)
-            token_short = pre_model_output_short.reshape(batch_size, -1)
-
-            token_long  = self.proj_up(token_long)   # (batch_size, hidden_size)    
-            token_mid   = self.proj_up(token_mid)
-            token_short = self.proj_up(token_short)
-
-            tokens = torch.stack([token_long, token_mid, token_short], dim=1)  # (batch_size, 3, hidden_size)
-
-            inputs = torch.cat([self.cls_tokens_expand, tokens], dim=1)                    # (batch_size, 6, hidden_size)
-
-            output = self.cross_attention(inputs_embeds=inputs)
-
-            cls_outputs = output.last_hidden_state[:, :3, :]  # (batch_size, 3, hidden_size)
-
-            final_pred = self.proj_back(cls_outputs)   # (batch_size, 3, act_dim * num_ctrl_pts)
-            final_pred = final_pred.reshape(batch_size, 3, num_ctrl_pts, act_dim)
-
-            model_output_long  = final_pred[:, 0, :, :]  # (batch_size, num_ctrl_pts, act_dim)
-            model_output_mid   = final_pred[:, 1, :, :]
-            model_output_short = final_pred[:, 2, :, :]
+            model_output_long, model_output_mid, model_output_short = model(trajectory_long, trajectory_mid, trajectory_short, t, 
+                local_cond=local_cond, global_cond_long=global_cond_long, global_cond_mid=global_cond_mid, global_cond_short=global_cond_short)
 
             # 3. compute previous image: x_t -> x_t-1
             trajectory_long = scheduler.step(
@@ -242,11 +208,28 @@ class DiffusionUnetImagePolicy(BaseImagePolicy):
         local_cond = None
         global_cond = None
         if self.obs_as_global_cond:
-            # condition through global feature
-            this_nobs = dict_apply(nobs, lambda x: x[:,:To,...].reshape(-1,*x.shape[2:]))
-            nobs_features = self.obs_encoder(this_nobs)
-            # reshape back to B, Do
-            global_cond = nobs_features.reshape(B, -1)
+            n_obs_steps_use = math.ceil(To // 3)
+
+            short_indices = list(range(To - n_obs_steps_use, To))                       # [4,5,6]
+            mid_indices   = list(range(To - n_obs_steps_use*2 + 1, To, 2))[:n_obs_steps_use]    # [2,4,6]
+            long_indices  = list(range(To - n_obs_steps_use*3 + 2, To, 3))[:n_obs_steps_use]    # [0,4,6]
+
+            assert len(short_indices) == n_obs_steps_use
+            assert len(mid_indices)   == n_obs_steps_use
+            assert len(long_indices)  == n_obs_steps_use
+
+            this_nobs_short = dict_apply(nobs, lambda x: x[:, short_indices, ...].reshape(-1, *x.shape[2:]))
+            this_nobs_mid   = dict_apply(nobs, lambda x: x[:, mid_indices,   ...].reshape(-1, *x.shape[2:]))
+            this_nobs_long  = dict_apply(nobs, lambda x: x[:, long_indices,  ...].reshape(-1, *x.shape[2:]))
+
+            nobs_features_long = self.obs_encoder(this_nobs_long)
+            nobs_features_mid = self.obs_encoder(this_nobs_mid)
+            nobs_features_short = self.obs_encoder(this_nobs_short)
+
+            global_cond_long = nobs_features_long.reshape(B, -1)
+            global_cond_mid = nobs_features_mid.reshape(B, -1)
+            global_cond_short = nobs_features_short.reshape(B, -1)
+
             # empty data for action
             cond_data = torch.zeros(size=(B, self.num_ctrl_pts * 3, Da), device=device, dtype=dtype)
             cond_mask = torch.zeros_like(cond_data, dtype=torch.bool)
@@ -267,7 +250,9 @@ class DiffusionUnetImagePolicy(BaseImagePolicy):
             cond_data, 
             cond_mask,
             local_cond=local_cond,
-            global_cond=global_cond,
+            global_cond_long=global_cond_long,
+            global_cond_mid=global_cond_mid,
+            global_cond_short=global_cond_short,
             **self.kwargs)
         
         # unnormalize prediction
@@ -284,13 +269,11 @@ class DiffusionUnetImagePolicy(BaseImagePolicy):
         action_pred = bezier_upsample(ctrl_pts_pred_long, ctrl_pts_pred_mid, ctrl_pts_pred_short, self.horizon)
         # 形状 (batch_size, horizon / 4 = 16, act_dim)
 
-
         # get action
         start = To - 1
         end = start + self.n_action_steps
         action = action_pred[:,start:end, :]
-        # 预测了 12 步，实际执行了 8 步
-
+        # 预测了 16 步，实际执行了 8 步
 
         result = {
             'action': action,
