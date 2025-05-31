@@ -31,7 +31,7 @@ class DiffusionUnetImagePolicy(BaseImagePolicy):
             n_groups=8,
             cond_predict_scale=True,
             transformer_emb_size=512,
-            num_ctrl_pts=5,
+            num_ctrl_pts=8,
             # parameters passed to step
             **kwargs):
         super().__init__()
@@ -50,9 +50,15 @@ class DiffusionUnetImagePolicy(BaseImagePolicy):
             input_dim = action_dim
             global_cond_dim = obs_feature_dim * n_obs_steps
 
+
+        config = BertConfig(hidden_size=transformer_emb_size, num_attention_heads=8, intermediate_size=transformer_emb_size * 4, num_hidden_layers=4)
+   
+        self.cross_attention = BertModel(config)
         
         model = ConditionalUnet1D(
             input_dim=input_dim,
+            cross_attention=self.cross_attention,
+            num_ctrl_pts=self.num_ctrl_pts,
             local_cond_dim=None,
             global_cond_dim=global_cond_dim,
             diffusion_step_embed_dim=diffusion_step_embed_dim,
@@ -61,20 +67,12 @@ class DiffusionUnetImagePolicy(BaseImagePolicy):
             n_groups=n_groups,
             cond_predict_scale=cond_predict_scale
         )
+     
 
-        config = BertConfig(hidden_size=transformer_emb_size, num_attention_heads=8, intermediate_size=transformer_emb_size * 4, num_hidden_layers=4)
-        
-        self.cross_attention = BertModel(config)
 
         self.obs_encoder = obs_encoder
 
-        self.model_long = model
-        self.model_mid = model
-        self.model_short = model
-        self.transformer_emb_size = transformer_emb_size
-
-        self.proj_up = nn.Linear(action_dim * num_ctrl_pts, self.transformer_emb_size)
-        self.proj_back = nn.Linear(self.transformer_emb_size, action_dim * num_ctrl_pts)
+        self.model = model
 
         self.noise_scheduler = noise_scheduler
         self.mask_generator = LowdimMaskGenerator(
@@ -104,10 +102,6 @@ class DiffusionUnetImagePolicy(BaseImagePolicy):
         self.data_fitter_short = BezierFitter(input_dim=self.action_dim, num_control_points=self.num_ctrl_pts, horizon_length=self.horizon//4)
         ###################################################################################
 
-        self.transformer_emb_size = transformer_emb_size
-        self.cls_tokens = nn.Parameter(torch.zeros(3, 1, self.transformer_emb_size))  # (3, 1, hidden_size)
-        nn.init.trunc_normal_(self.cls_tokens, std=0.02)  # 初始化一下
-        self.cls_tokens_expand = self.cls_tokens.expand(-1, 128, -1).transpose(0, 1)  # 这里 batch_size 写死了，以后再改
     
     # ========= inference  ============
     def conditional_sample(self, 
@@ -118,6 +112,7 @@ class DiffusionUnetImagePolicy(BaseImagePolicy):
             **kwargs
             ):
         
+        # 这里还得改，已经没有 model_long 了
         model_long = self.model_long
         model_mid = self.model_mid
         model_short = self.model_short
@@ -316,32 +311,30 @@ class DiffusionUnetImagePolicy(BaseImagePolicy):
         horizon = nactions.shape[1]
         device = self.device
 
-        ################################################
-        ## 生成三个层级控制点的 ground truth 
+
+        # 生成三个层级控制点的 ground truth 
         nactions = nactions.transpose(1, 2) # (batch_size, act_dim, horizon)
         # (batch_size, act_dim, horizon) -> (batch_size, act_dim, num_ctrl_pts)
         gt_control_pts_long = self.data_fitter_long.fit(nactions)
         gt_control_pts_mid = self.data_fitter_mid.fit(nactions[:, :, :nactions.shape[2]//2])
         gt_control_pts_short = self.data_fitter_short.fit(nactions[:, :, :nactions.shape[2]//4])
-        ################################################
 
         # handle different ways of passing observation
         local_cond = None
         global_cond = None
 
-        ################################################
-        # 试图交换维度顺序
-        trajectory_long = torch.tensor(gt_control_pts_long, device=device).transpose(1, 2)  ## 把轨迹改成 gt_control_pts_long ，就是拟合的控制点
-        trajectory_mid = torch.tensor(gt_control_pts_mid, device=device).transpose(1, 2)  ## 把轨迹改成 gt_control_pts_mid ，就是拟合的控制点
-        trajectory_short = torch.tensor(gt_control_pts_short, device=device).transpose(1, 2)  ## 把轨迹改成 gt_control_pts_long ，就是拟合的控制点
-        ################################################
+        # 试图交换维度顺序 （B, h, t) -> (B, t, h)
+        trajectory_long = torch.tensor(gt_control_pts_long, device=device, dtype=torch.float32).transpose(1, 2)  ## 把轨迹改成 gt_control_pts_long ，就是拟合的控制点
+        trajectory_mid = torch.tensor(gt_control_pts_mid, device=device, dtype=torch.float32).transpose(1, 2)  ## 把轨迹改成 gt_control_pts_mid ，就是拟合的控制点
+        trajectory_short = torch.tensor(gt_control_pts_short, device=device, dtype=torch.float32).transpose(1, 2)  ## 把轨迹改成 gt_control_pts_long ，就是拟合的控制点
+
 
         cond_data_long = trajectory_long  
         cond_data_mid = trajectory_mid
         cond_data_short = trajectory_short  
 
-        ## 由于默认配置是 obs_as_global_cond == true，所以另外一种情况先不考虑
-        ## 下面是 obs 编码，与我们的改进无关，所以先不改
+        # 由于默认配置是 obs_as_global_cond == true，所以另外一种情况先不考虑
+        # 下面是 obs 编码，与我们的改进无关，所以先不改
         if self.obs_as_global_cond:
             # reshape B, T, ... to B*T
             this_nobs = dict_apply(nobs, 
@@ -358,7 +351,7 @@ class DiffusionUnetImagePolicy(BaseImagePolicy):
             cond_data = torch.cat([nactions, nobs_features], dim=-1)
             trajectory_long = cond_data.detach()
 
-        # generate impainting mask  # 这里面临这维度顺序引发的问题，需要整体调整
+        # generate impainting mask  # 这里有维度顺序不对引发的问题，需要整体调整  # 目前调好了
         condition_mask_long = self.mask_generator(trajectory_long.shape)
         condition_mask_mid = self.mask_generator(trajectory_mid.shape)
         condition_mask_short = self.mask_generator(trajectory_short.shape)
@@ -372,7 +365,6 @@ class DiffusionUnetImagePolicy(BaseImagePolicy):
 
         bsz = trajectory_long.shape[0]
 
-
         # Sample a random timestep for each image
         # 使用共享的时间步
         timesteps = torch.randint(
@@ -380,7 +372,6 @@ class DiffusionUnetImagePolicy(BaseImagePolicy):
             (bsz,), device=trajectory_long.device
         ).long()
         
-
         # Add noise_long to the clean images according to the noise_long magnitude at each timestep
         # (this is the forward diffusion process)
         noisy_trajectory_long = self.noise_scheduler.add_noise(
@@ -405,38 +396,9 @@ class DiffusionUnetImagePolicy(BaseImagePolicy):
 
 
         # Predict the noise_long residual  去噪过程
-        pre_pred_long = self.model_long(noisy_trajectory_long, timesteps, 
+        pred_long, pred_mid, pred_short = self.model(noisy_trajectory_long, noisy_trajectory_mid, 
+            noisy_trajectory_short, timesteps,
             local_cond=local_cond, global_cond=global_cond)  
-                
-        pre_pred_mid = self.model_mid(noisy_trajectory_mid, timesteps, 
-            local_cond=local_cond, global_cond=global_cond)  
-        
-        pre_pred_short = self.model_short(noisy_trajectory_short, timesteps, 
-            local_cond=local_cond, global_cond=global_cond)  
-        
-        batch_size, num_ctrl_pts, act_dim = pre_pred_long.shape  # 这里调整了，以改变维度顺序
-
-        token_long  = pre_pred_long.reshape(batch_size, -1)  # (batch_size, act_dim * num_ctrl_pts)
-        token_mid   = pre_pred_mid.reshape(batch_size, -1)
-        token_short = pre_pred_short.reshape(batch_size, -1)
-
-        token_long  = self.proj_up(token_long)   # (batch_size, hidden_size)    
-        token_mid   = self.proj_up(token_mid)
-        token_short = self.proj_up(token_short)
-
-        tokens = torch.stack([token_long, token_mid, token_short], dim=1)  # (batch_size, 3, hidden_size)
-
-        inputs = torch.cat([self.cls_tokens_expand, tokens], dim=1)                    # (batch_size, 6, hidden_size)
-
-        output = self.cross_attention(inputs_embeds=inputs)
-        cls_outputs = output.last_hidden_state[:, :3, :]  # (batch_size, 3, hidden_size)
-
-        final_pred = self.proj_back(cls_outputs)   # (batch_size, 3, act_dim * num_ctrl_pts)
-        final_pred = final_pred.reshape(batch_size, 3, num_ctrl_pts, act_dim)  # 这里调整了，以改变维度顺序
-
-        pred_long  = final_pred[:, 0, :, :]  # (batch_size, act_dim, num_ctrl_pts)
-        pred_mid   = final_pred[:, 1, :, :]
-        pred_short = final_pred[:, 2, :, :]
 
         pred_type = self.noise_scheduler.config.prediction_type 
         if pred_type == 'epsilon':

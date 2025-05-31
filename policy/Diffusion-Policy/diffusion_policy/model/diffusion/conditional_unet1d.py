@@ -39,19 +39,31 @@ class ConditionalResidualBlock1D(nn.Module):
             Rearrange('batch t -> batch t 1'),
         )
 
+
+        ## 这些代码是否有必要保留，还需要再考虑考虑
+        # self.proj_up = nn.Linear(action_dim * num_ctrl_pts, self.transformer_emb_size)  ## 这个东西是否还有必要，存疑
+        # self.proj_back = nn.Linear(self.transformer_emb_size, action_dim * num_ctrl_pts)  ## 这个东西是否还有必要，存疑
+
+        # self.transformer_emb_size = transformer_emb_size
+        # self.cls_tokens = nn.Parameter(torch.zeros(3, 1, self.transformer_emb_size))  # (3, 1, hidden_size)
+        # nn.init.trunc_normal_(self.cls_tokens, std=0.02)  # 初始化一下
+        # self.cls_tokens_expand = self.cls_tokens.expand(-1, 128, -1).transpose(0, 1)  # 这里 batch_size 写死了，以后再改
+
+
+
         # make sure dimensions compatible
         self.residual_conv = nn.Conv1d(in_channels, out_channels, 1) \
             if in_channels != out_channels else nn.Identity()
 
-    def forward(self, x, cond):
+    def forward(self, sample_long, cond):
         '''
-            x : [ batch_size x in_channels x horizon ]
-            cond : [ batch_size x cond_dim]
+            sample_long : [ batch_size sample_long in_channels sample_long horizon ]
+            cond : [ batch_size sample_long cond_dim]
 
             returns:
-            out : [ batch_size x out_channels x horizon ]
+            out : [ batch_size sample_long out_channels sample_long horizon ]
         '''
-        out = self.blocks[0](x)
+        out = self.blocks[0](sample_long)
         embed = self.cond_encoder(cond)
         if self.cond_predict_scale:
             embed = embed.reshape(
@@ -62,13 +74,15 @@ class ConditionalResidualBlock1D(nn.Module):
         else:
             out = out + embed
         out = self.blocks[1](out)
-        out = out + self.residual_conv(x)
+        out = out + self.residual_conv(sample_long)
         return out
 
 
 class ConditionalUnet1D(nn.Module):
     def __init__(self, 
         input_dim,
+        cross_attention,
+        num_ctrl_pts=8,
         local_cond_dim=None,
         global_cond_dim=None,
         diffusion_step_embed_dim=256,
@@ -166,32 +180,53 @@ class ConditionalUnet1D(nn.Module):
         self.down_modules = down_modules
         self.final_conv = final_conv
 
+        self.cross_attention = cross_attention
+        self.num_ctrl_pts = num_ctrl_pts
+        self.depth = len(down_dims)
+
+        # learnable CLS token list (for upsample and downsample)
+        self.cls_token_list = nn.ModuleList([
+            nn.Parameter(torch.randn(1, 3, down_dims[0]*self.num_ctrl_pts//2))  # 这里把这个维度给写死了，默认了最后一层的 time_horizon 为 1
+            for dim in down_dims
+        ])
+
+        # learnable CLS token (for mid process)
+        self.mid_cls_tokens = nn.Parameter(torch.randn(1, 3, down_dims[0]*self.num_ctrl_pts//2))
+
         logger.info(
             "number of parameters: %e", sum(p.numel() for p in self.parameters())
         )
 
     def forward(self, 
-            sample: torch.Tensor, 
+            sample_long: torch.Tensor, 
+            sample_mid: torch.Tensor, 
+            sample_short: torch.Tensor, 
             timestep: Union[torch.Tensor, float, int], 
             local_cond=None, global_cond=None, **kwargs):
         """
-        x: (B,T,input_dim)
+        sample_long: (B,T,input_dim)
+        sample_mid: (B,T,input_dim)
+        sample_short: (B,T,input_dim)
         timestep: (B,) or int, diffusion step
         local_cond: (B,T,local_cond_dim)
         global_cond: (B,global_cond_dim)
         output: (B,T,input_dim)
         """
-        sample = einops.rearrange(sample, 'b h t -> b t h')
+        sample_long = einops.rearrange(sample_long, 'b h t -> b t h')
+        sample_mid = einops.rearrange(sample_mid, 'b h t -> b t h')
+        sample_short = einops.rearrange(sample_short, 'b h t -> b t h')
+        
+        batch_size = sample_long.shape[0]
 
-        # 1. time
+        # 1. 时间步编码，并把时间步编码和 obs 拼接
         timesteps = timestep
         if not torch.is_tensor(timesteps):
             # TODO: this requires sync between CPU and GPU. So try to pass timesteps as tensors if you can
-            timesteps = torch.tensor([timesteps], dtype=torch.long, device=sample.device)
+            timesteps = torch.tensor([timesteps], dtype=torch.long, device=sample_long.device)
         elif torch.is_tensor(timesteps) and len(timesteps.shape) == 0:
-            timesteps = timesteps[None].to(sample.device)
+            timesteps = timesteps[None].to(sample_long.device)
         # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
-        timesteps = timesteps.expand(sample.shape[0])
+        timesteps = timesteps.expand(sample_long.shape[0])
 
         global_feature = self.diffusion_step_encoder(timesteps)
 
@@ -201,42 +236,138 @@ class ConditionalUnet1D(nn.Module):
             ], axis=-1)
         
         # encode local features
+        # 这种情况不会出现，local_cond 是 None 已经被写死了，下面的代码没用，就不改了
         h_local = list()
         if local_cond is not None:
             local_cond = einops.rearrange(local_cond, 'b h t -> b t h')
             resnet, resnet2 = self.local_cond_encoder
-            x = resnet(local_cond, global_feature)
-            h_local.append(x)
-            x = resnet2(local_cond, global_feature)
-            h_local.append(x)
+            sample_long = resnet(local_cond, global_feature)
+            h_local.append(sample_long)
+            sample_long = resnet2(local_cond, global_feature)
+            h_local.append(sample_long)
         
-        x = sample
-        h = []
+
+        # 开三个数组保存中间特征，便于 skip conn
+        h_long = []
+        h_mid = []
+        h_short = []
+
+        # 下采样过程
         for idx, (resnet, resnet2, downsample) in enumerate(self.down_modules):
-            x = resnet(x, global_feature)
+            sample_long = resnet(sample_long, global_feature)
+            sample_mid = resnet(sample_mid, global_feature)
+            sample_short = resnet(sample_short, global_feature)
+
             if idx == 0 and len(h_local) > 0:
-                x = x + h_local[0]
-            x = resnet2(x, global_feature)
-            h.append(x)
-            x = downsample(x)
+                sample_long = sample_long + h_local[0]
+                sample_mid = sample_mid + h_local[0]
+                sample_short = sample_short + h_local[0]
 
+            sample_long = resnet2(sample_long, global_feature)
+            sample_mid = resnet2(sample_mid, global_feature)
+            sample_short = resnet2(sample_short, global_feature)
+
+            h_long.append(sample_long)
+            h_mid.append(sample_mid)
+            h_short.append(sample_short)
+
+            # max_pool 时间尺寸减半
+            sample_long = downsample(sample_long)
+            sample_mid = downsample(sample_mid)
+            sample_short = downsample(sample_short)
+                        
+            _, C, T = sample_long.shape 
+
+            sample_long = sample_long.reshape(batch_size, -1) # (B, C*T)
+            sample_mid = sample_mid.reshape(batch_size, -1)
+            sample_short = sample_short.reshape(batch_size, -1)
+
+            tokens_from_sample = torch.stack([sample_long, sample_mid, sample_short], dim=1) # (B, 3, C*T)
+            cls_tokens = self.cls_token_list[idx].expand(batch_size, -1, -1)
+            tokens = torch.cat([cls_tokens, tokens_from_sample], dim=1) # (B, 6, C*T)
+
+            output = self.cross_attention(tokens) # (B, 6, C*T)
+
+            sample_long = output[:, 0, :].reshape(batch_size, C, T)
+            sample_mid = output[:, 1, :].reshape(batch_size, C, T)
+            sample_short = output[:, 2, :].reshape(batch_size, C, T)
+
+        # 中间层，实际只有 1 块，2 个 resnet
         for mid_module in self.mid_modules:
-            x = mid_module(x, global_feature)
 
+            # sample_long/mid/short 的形状：(B, C, T)
+            sample_long = mid_module(sample_long, global_feature)
+            sample_mid = mid_module(sample_mid, global_feature)
+            sample_short = mid_module(sample_short, global_feature)
+
+            _, C, T = sample_long.shape
+
+            sample_long = sample_long.reshape(batch_size, -1)
+            sample_mid = sample_mid.reshape(batch_size, -1)
+            sample_short = sample_short.reshape(batch_size, -1)
+
+            tokens_from_sample = torch.stack([sample_long, sample_mid, sample_short], dim = 1) #(batch_size, 3， C*T)
+            cls_tokens = self.mid_cls_tokens.expand(batch_size, -1, -1) #(B, 3, C*T)
+            tokens = torch.cat([cls_tokens, tokens_from_sample], dim=1)
+
+            output = self.cross_attention(tokens) # (B, 6, C*T)
+
+            # 取出前三个输出
+            sample_long = output[:, 0, :].reshape(batch_size, C, T)
+            sample_mid = output[:, 1, :].reshape(batch_size, C, T)
+            sample_short = output[:, 2, :].reshape(batch_size, C, T)
+
+
+        # 上采样过程 
         for idx, (resnet, resnet2, upsample) in enumerate(self.up_modules):
-            x = torch.cat((x, h.pop()), dim=1)
-            x = resnet(x, global_feature)
+            sample_long = torch.cat((sample_long, h_long.pop()), dim=1)
+            sample_mid = torch.cat((sample_mid, h_mid.pop()), dim=1)
+            sample_short = torch.cat((sample_short, h_short.pop()), dim=1)
+
+            sample_long = resnet(sample_long, global_feature)
+            sample_mid = resnet(sample_mid, global_feature)
+            sample_short = resnet(sample_short, global_feature)
+
             # The correct condition should be:
             # if idx == (len(self.up_modules)-1) and len(h_local) > 0:
             # However this change will break compatibility with published checkpoints.
             # Therefore it is left as a comment.
             if idx == len(self.up_modules) and len(h_local) > 0:
-                x = x + h_local[1]
-            x = resnet2(x, global_feature)
-            x = upsample(x)
+                sample_long = sample_long + h_local[1]
+                sample_mid = sample_mid + h_local[1]
+                sample_short = sample_short + h_local[1]
 
-        x = self.final_conv(x)
+            sample_long = resnet2(sample_long, global_feature)
+            sample_mid = resnet2(sample_mid, global_feature)
+            sample_short = resnet2(sample_short, global_feature)
 
-        x = einops.rearrange(x, 'b t h -> b h t')
-        return x
+            sample_long = upsample(sample_long)
+            sample_mid = upsample(sample_mid)
+            sample_short = upsample(sample_short)
+            
+            _, C, T = sample_long.shape 
+
+            sample_long = sample_long.reshape(batch_size, -1) # (B, C*T)
+            sample_mid = sample_mid.reshape(batch_size, -1)
+            sample_short = sample_short.reshape(batch_size, -1)
+
+            tokens_from_sample = torch.stack([sample_long, sample_mid, sample_short], dim=1) # (B, 3, C*T)
+            cls_tokens = self.cls_token_list[self.depth - idx - 1].expand(batch_size, -1, -1)
+            tokens = torch.cat([cls_tokens, tokens_from_sample], dim=1) # (B, 6, C*T)
+
+            output = self.cross_attention(tokens) # (B, 6, C*T)
+
+            sample_long = output[:, 0, :].reshape(batch_size, C, T)
+            sample_mid = output[:, 1, :].reshape(batch_size, C, T)
+            sample_short = output[:, 2, :].reshape(batch_size, C, T)
+
+        sample_long = self.final_conv(sample_long)
+        sample_mid = self.final_conv(sample_mid)
+        sample_short = self.final_conv(sample_short)
+
+        sample_long = einops.rearrange(sample_long, 'b t h -> b h t')
+        sample_mid = einops.rearrange(sample_mid, 'b t h -> b h t')
+        sample_short = einops.rearrange(sample_short, 'b t h -> b h t')
+
+        return sample_long, sample_mid, sample_short
 

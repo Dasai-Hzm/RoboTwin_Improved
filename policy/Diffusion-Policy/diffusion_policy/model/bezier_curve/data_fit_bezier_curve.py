@@ -4,11 +4,11 @@ from scipy.special import comb
 
 
 class BezierFitter:
-    def __init__(self, input_dim=14, num_control_points=5, horizon_length=64):
+    def __init__(self, input_dim=14, num_control_points=8, horizon_length=64):
         """
         贝塞尔曲线拟合器
         :param input_dim: 输入数据维度 (默认14)
-        :param num_control_points: 控制点数量 (至少2个，默认5)
+        :param num_control_points: 控制点数量 (至少2个，默认8)
         :param horizon_length: 输入数据长度 (至少2个点，默认64)
         """
         # 参数验证
