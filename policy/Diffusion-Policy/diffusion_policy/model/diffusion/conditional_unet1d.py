@@ -40,17 +40,6 @@ class ConditionalResidualBlock1D(nn.Module):
         )
 
 
-        ## 这些代码是否有必要保留，还需要再考虑考虑
-        # self.proj_up = nn.Linear(action_dim * num_ctrl_pts, self.transformer_emb_size)  ## 这个东西是否还有必要，存疑
-        # self.proj_back = nn.Linear(self.transformer_emb_size, action_dim * num_ctrl_pts)  ## 这个东西是否还有必要，存疑
-
-        # self.transformer_emb_size = transformer_emb_size
-        # self.cls_tokens = nn.Parameter(torch.zeros(3, 1, self.transformer_emb_size))  # (3, 1, hidden_size)
-        # nn.init.trunc_normal_(self.cls_tokens, std=0.02)  # 初始化一下
-        # self.cls_tokens_expand = self.cls_tokens.expand(-1, 128, -1).transpose(0, 1)  # 这里 batch_size 写死了，以后再改
-
-
-
         # make sure dimensions compatible
         self.residual_conv = nn.Conv1d(in_channels, out_channels, 1) \
             if in_channels != out_channels else nn.Identity()
@@ -202,7 +191,8 @@ class ConditionalUnet1D(nn.Module):
             sample_mid: torch.Tensor, 
             sample_short: torch.Tensor, 
             timestep: Union[torch.Tensor, float, int], 
-            local_cond=None, global_cond=None, **kwargs):
+            local_cond=None, global_cond_long=None, 
+            global_cond_mid=None, global_cond_short=None, **kwargs):
         """
         sample_long: (B,T,input_dim)
         sample_mid: (B,T,input_dim)
@@ -230,9 +220,19 @@ class ConditionalUnet1D(nn.Module):
 
         global_feature = self.diffusion_step_encoder(timesteps)
 
-        if global_cond is not None:
-            global_feature = torch.cat([
-                global_feature, global_cond
+        if global_cond_long is not None:
+            global_feature_long = torch.cat([
+                global_feature, global_cond_long
+            ], axis=-1)
+
+        if global_cond_mid is not None:
+            global_feature_mid = torch.cat([
+                global_feature, global_cond_mid
+            ], axis=-1)
+        
+        if global_cond_short is not None:
+            global_feature_short = torch.cat([
+                global_feature, global_cond_short
             ], axis=-1)
         
         # encode local features
@@ -241,9 +241,9 @@ class ConditionalUnet1D(nn.Module):
         if local_cond is not None:
             local_cond = einops.rearrange(local_cond, 'b h t -> b t h')
             resnet, resnet2 = self.local_cond_encoder
-            sample_long = resnet(local_cond, global_feature)
+            sample_long = resnet(local_cond, global_feature_long)
             h_local.append(sample_long)
-            sample_long = resnet2(local_cond, global_feature)
+            sample_long = resnet2(local_cond, global_feature_long)
             h_local.append(sample_long)
         
 
@@ -254,18 +254,18 @@ class ConditionalUnet1D(nn.Module):
 
         # 下采样过程
         for idx, (resnet, resnet2, downsample) in enumerate(self.down_modules):
-            sample_long = resnet(sample_long, global_feature)
-            sample_mid = resnet(sample_mid, global_feature)
-            sample_short = resnet(sample_short, global_feature)
+            sample_long = resnet(sample_long, global_feature_long)
+            sample_mid = resnet(sample_mid, global_feature_mid)
+            sample_short = resnet(sample_short, global_feature_short)
 
             if idx == 0 and len(h_local) > 0:
                 sample_long = sample_long + h_local[0]
                 sample_mid = sample_mid + h_local[0]
                 sample_short = sample_short + h_local[0]
 
-            sample_long = resnet2(sample_long, global_feature)
-            sample_mid = resnet2(sample_mid, global_feature)
-            sample_short = resnet2(sample_short, global_feature)
+            sample_long = resnet2(sample_long, global_feature_long)
+            sample_mid = resnet2(sample_mid, global_feature_mid)
+            sample_short = resnet2(sample_short, global_feature_short)
 
             h_long.append(sample_long)
             h_mid.append(sample_mid)
@@ -296,9 +296,9 @@ class ConditionalUnet1D(nn.Module):
         for mid_module in self.mid_modules:
 
             # sample_long/mid/short 的形状：(B, C, T)
-            sample_long = mid_module(sample_long, global_feature)
-            sample_mid = mid_module(sample_mid, global_feature)
-            sample_short = mid_module(sample_short, global_feature)
+            sample_long = mid_module(sample_long, global_feature_long)
+            sample_mid = mid_module(sample_mid, global_feature_mid)
+            sample_short = mid_module(sample_short, global_feature_short)
 
             _, C, T = sample_long.shape
 
@@ -324,9 +324,9 @@ class ConditionalUnet1D(nn.Module):
             sample_mid = torch.cat((sample_mid, h_mid.pop()), dim=1)
             sample_short = torch.cat((sample_short, h_short.pop()), dim=1)
 
-            sample_long = resnet(sample_long, global_feature)
-            sample_mid = resnet(sample_mid, global_feature)
-            sample_short = resnet(sample_short, global_feature)
+            sample_long = resnet(sample_long, global_feature_long)
+            sample_mid = resnet(sample_mid, global_feature_mid)
+            sample_short = resnet(sample_short, global_feature_short)
 
             # The correct condition should be:
             # if idx == (len(self.up_modules)-1) and len(h_local) > 0:
@@ -337,9 +337,9 @@ class ConditionalUnet1D(nn.Module):
                 sample_mid = sample_mid + h_local[1]
                 sample_short = sample_short + h_local[1]
 
-            sample_long = resnet2(sample_long, global_feature)
-            sample_mid = resnet2(sample_mid, global_feature)
-            sample_short = resnet2(sample_short, global_feature)
+            sample_long = resnet2(sample_long, global_feature_long)
+            sample_mid = resnet2(sample_mid, global_feature_mid)
+            sample_short = resnet2(sample_short, global_feature_short)
 
             sample_long = upsample(sample_long)
             sample_mid = upsample(sample_mid)

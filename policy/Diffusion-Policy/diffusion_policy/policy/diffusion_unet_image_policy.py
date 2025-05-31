@@ -2,6 +2,7 @@ from typing import Dict
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import math
 from einops import rearrange, reduce
 from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
 from transformers import BertModel, BertConfig
@@ -334,14 +335,36 @@ class DiffusionUnetImagePolicy(BaseImagePolicy):
         cond_data_short = trajectory_short  
 
         # 由于默认配置是 obs_as_global_cond == true，所以另外一种情况先不考虑
-        # 下面是 obs 编码，与我们的改进无关，所以先不改
+
         if self.obs_as_global_cond:
             # reshape B, T, ... to B*T
-            this_nobs = dict_apply(nobs, 
-                lambda x: x[:,:self.n_obs_steps,...].reshape(-1,*x.shape[2:]))
-            nobs_features = self.obs_encoder(this_nobs)
+            # 假设 nobs shape: (B, T, ...)
+            B, T = next(iter(nobs.values())).shape[:2]
+
+            # 要取的观测数量
+            n_obs_steps_use = math.ceil(self.n_obs_steps // 3)
+
+            # 取 short/mid/long 的时间索引
+            short_indices = list(range(T - n_obs_steps_use, T))                       # [4,5,6]
+            mid_indices   = list(range(T - n_obs_steps_use*2 + 1, T, 2))[:n_obs_steps_use]    # [2,4,6]
+            long_indices  = list(range(T - n_obs_steps_use*3 + 2, T, 3))[:n_obs_steps_use]    # [0,4,6]
+
+            assert len(short_indices) == n_obs_steps_use
+            assert len(mid_indices)   == n_obs_steps_use
+            assert len(long_indices)  == n_obs_steps_use
+
+            # dict_apply 仿照写法
+            this_nobs_short = dict_apply(nobs, lambda x: x[:, short_indices, ...].reshape(-1, *x.shape[2:]))
+            this_nobs_mid   = dict_apply(nobs, lambda x: x[:, mid_indices,   ...].reshape(-1, *x.shape[2:]))
+            this_nobs_long  = dict_apply(nobs, lambda x: x[:, long_indices,  ...].reshape(-1, *x.shape[2:]))
+
+            nobs_features_long = self.obs_encoder(this_nobs_long)
+            nobs_features_mid = self.obs_encoder(this_nobs_mid)
+            nobs_features_short = self.obs_encoder(this_nobs_short)
             # reshape back to B, Do
-            global_cond = nobs_features.reshape(batch_size, -1)
+            global_cond_long = nobs_features_long.reshape(batch_size, -1)
+            global_cond_mid = nobs_features_mid.reshape(batch_size, -1)
+            global_cond_short = nobs_features_short.reshape(batch_size, -1)
         else:
             # reshape B, T, ... to B*T
             this_nobs = dict_apply(nobs, lambda x: x.reshape(-1, *x.shape[2:]))
@@ -351,13 +374,12 @@ class DiffusionUnetImagePolicy(BaseImagePolicy):
             cond_data = torch.cat([nactions, nobs_features], dim=-1)
             trajectory_long = cond_data.detach()
 
-        # generate impainting mask  # 这里有维度顺序不对引发的问题，需要整体调整  # 目前调好了
+        # generate impainting mask  
         condition_mask_long = self.mask_generator(trajectory_long.shape)
         condition_mask_mid = self.mask_generator(trajectory_mid.shape)
         condition_mask_short = self.mask_generator(trajectory_short.shape)
 
         # Sample noise_long that we'll add to the images
-        ################################################
         # 生成三个层级的噪声
         noise_long = torch.randn(trajectory_long.shape, device=trajectory_long.device)
         noise_mid = torch.randn(trajectory_mid.shape, device=trajectory_mid.device)
@@ -382,7 +404,7 @@ class DiffusionUnetImagePolicy(BaseImagePolicy):
 
         noisy_trajectory_short = self.noise_scheduler.add_noise(
             trajectory_short, noise_short, timesteps)
-        ################################################
+
 
         # compute loss mask
         loss_mask_long = ~condition_mask_long
@@ -398,7 +420,8 @@ class DiffusionUnetImagePolicy(BaseImagePolicy):
         # Predict the noise_long residual  去噪过程
         pred_long, pred_mid, pred_short = self.model(noisy_trajectory_long, noisy_trajectory_mid, 
             noisy_trajectory_short, timesteps,
-            local_cond=local_cond, global_cond=global_cond)  
+            local_cond=local_cond, global_cond_long=global_cond_long, 
+            global_cond_mid=global_cond_mid, global_cond_short=global_cond_short)  
 
         pred_type = self.noise_scheduler.config.prediction_type 
         if pred_type == 'epsilon':
@@ -413,7 +436,7 @@ class DiffusionUnetImagePolicy(BaseImagePolicy):
         else:
             raise ValueError(f"Unsupported prediction type {pred_type}")
 
-        ################################################
+    
         loss_long = F.mse_loss(pred_long, target_long, reduction='none')
         loss_long = loss_long * loss_mask_long.type(loss_long.dtype)
         loss_long = reduce(loss_long, 'b ... -> b (...)', 'mean')
@@ -429,8 +452,8 @@ class DiffusionUnetImagePolicy(BaseImagePolicy):
         loss_short = reduce(loss_short, 'b ... -> b (...)', 'mean')
         loss_short = loss_short.mean()
 
-        ## 这个比例还可以调，目前这种分配是希望模型多学习长远的规划
+        # 这个比例还可以调，目前这种分配是希望模型多学习长远的规划
         loss = (loss_long * 1.25 + loss_mid * 1 + loss_short * 0.75) / 3
-        ################################################
+
 
         return loss
